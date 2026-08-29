@@ -151,7 +151,7 @@ Citation information is provided in the `CITATION.cff` file. GitHub can also use
 
 ## License
 
-Quivasp is released under the Apache License 2.0.
+Quivasp is released under the MIT License.
 
 You may use, modify, and redistribute the software under the terms of the license. Please retain the required copyright and license notices when redistributing the software.
 
