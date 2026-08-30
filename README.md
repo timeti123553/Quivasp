@@ -78,6 +78,45 @@ figure, axis = plot_band_structure(
 )
 ```
 
+Element-projected and orbital-projected band structures can be created from
+the same parsed VASP data when `vasprun.xml` contains a `<projected>` section:
+
+```python
+from quivasp import BandStructure
+
+bands = BandStructure.from_vasp("path/to/calculation")
+print(bands.available_elements)   # for example: ("Cr", "I")
+print(bands.available_orbitals)   # grouped and detailed orbital labels
+
+figure, axis = bands.plot(
+    elements=("Cr", "I"),
+    projection_scale=70,
+    output="element_projected_bands.png",
+    dpi=300,
+)
+```
+
+Example CrI3 element projection:
+
+![CrI3 element-projected band structure](docs/images/cr_i3_element_projected_bands.png)
+
+Orbital projections accept grouped labels such as `s`, `p`, and `d`, as well
+as detailed labels from VASP such as `px`, `py`, `pz`, and `dxy`:
+
+```python
+figure, axis = bands.plot(
+    orbitals=("p", "d"),
+    projection_colors=("tab:green", "tab:purple"),
+    projection_alpha=0.65,
+    output="orbital_projected_bands.png",
+    dpi=300,
+)
+```
+
+Example CrI3 orbital projection:
+
+![CrI3 orbital-projected band structure](docs/images/cr_i3_orbital_projected_bands.png)
+
 The plotting API supports custom energy ranges, figure sizes, line widths,
 spin colors, high-symmetry labels, Fermi-line visibility, output paths,
 formats, and DPI. It returns the Matplotlib figure and axes for further
