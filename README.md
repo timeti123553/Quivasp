@@ -83,6 +83,73 @@ spin colors, high-symmetry labels, Fermi-line visibility, output paths,
 formats, and DPI. It returns the Matplotlib figure and axes for further
 customization.
 
+Projection data in `vasprun.xml` can be displayed as publication-style fat
+bands. Element names and orbitals can be selected independently or together:
+
+```python
+# Cr and I contributions, with spin channels preserved.
+bands.plot(elements=["Cr", "I"], output="cri3-elements.png")
+
+# Grouped angular-momentum channels.
+bands.plot(orbitals=["s", "p", "d"], output="cri3-spd.png")
+
+# A specific element/orbital cross-section.
+bands.plot(
+    elements=["Cr"],
+    orbitals=["dxy", "dz2", "dx2-y2"],
+    projection_scale=36,
+    projection_threshold=0.03,
+    output="cri3-cr-d.png",
+)
+```
+
+Grouped `p` and `d` selections expand to the detailed VASP components. The
+detailed names `s`, `px`, `py`, `pz`, `dxy`, `dyz`, `dz2`, `dxz`, and
+`dx2-y2` are also accepted directly. Marker area encodes projection weight;
+color identifies the selected component, while marker shape and the underlying
+line color preserve spin information.
+
+## Band Structure Examples
+
+All figures below are generated directly from `tests/CrI3` and `tests/Si` by
+`python examples/generate_band_examples.py`.
+
+### CrI3
+
+#### Spin-polarized band structure
+
+![CrI3 spin-polarized band structure](docs/images/cri3_band_spin.png)
+
+#### Element-projected spin-polarized band structure
+
+![CrI3 element-projected spin-polarized band structure](docs/images/cri3_band_element_spin.png)
+
+#### Orbital-projected spin-polarized band structure: s / p / d
+
+![CrI3 grouped-orbital spin-polarized band structure](docs/images/cri3_band_orbital_spd_spin.png)
+
+#### Detailed orbital-projected spin-polarized band structure
+
+![CrI3 detailed-orbital spin-polarized band structure](docs/images/cri3_band_orbital_detailed_spin.png)
+
+### Si
+
+#### Band structure
+
+![Si band structure](docs/images/si_band.png)
+
+#### Element-projected band structure
+
+![Si element-projected band structure](docs/images/si_band_element.png)
+
+#### Orbital-projected band structure: s / p / d
+
+![Si grouped-orbital band structure](docs/images/si_band_orbital_spd.png)
+
+#### Detailed orbital-projected band structure
+
+![Si detailed-orbital band structure](docs/images/si_band_orbital_detailed.png)
+
 ## Project Structure
 
 ```text

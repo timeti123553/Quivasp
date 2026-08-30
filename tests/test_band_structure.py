@@ -76,3 +76,66 @@ def test_missing_vasprun_has_actionable_error(tmp_path: Path):
 def test_plot_rejects_inconsistent_custom_labels(cr_i3_bands: BandStructure):
     with pytest.raises(ValueError, match="custom labels"):
         cr_i3_bands.plot(labels=("Γ", "M"))
+
+
+def test_parses_element_and_orbital_projections(cr_i3_bands: BandStructure):
+    bands = cr_i3_bands
+
+    assert bands.atom_elements == ("Cr", "Cr", "I", "I", "I", "I", "I", "I")
+    assert bands.orbital_names == (
+        "s",
+        "py",
+        "pz",
+        "px",
+        "dxy",
+        "dyz",
+        "dz2",
+        "dxz",
+        "dx2-y2",
+    )
+    assert bands.projections is not None
+    assert bands.projections.shape == (2, 60, 44, 8, 9)
+
+    element = bands.projection_weights(elements=("Cr", "I"))
+    assert set(element) == {"Cr", "I"}
+    assert element["Cr"].shape == bands.energies.shape
+    assert np.all(element["Cr"] >= 0)
+
+    orbital = bands.projection_weights(orbitals=("s", "p", "d", "dz2"))
+    assert set(orbital) == {"s", "p", "d", "dz2"}
+    assert np.allclose(
+        orbital["p"],
+        bands.projections[..., 1:4].sum(axis=(3, 4)),
+    )
+
+    combined = bands.projection_weights(elements=("Cr",), orbitals=("d", "px"))
+    assert set(combined) == {"Cr d", "Cr px"}
+
+
+def test_projection_plot_is_savable(cr_i3_bands: BandStructure, tmp_path: Path):
+    output = tmp_path / "cri3-projected.png"
+    figure, axis = cr_i3_bands.plot(
+        elements=("Cr", "I"),
+        projection_scale=20,
+        projection_threshold=0.1,
+        output=output,
+        dpi=100,
+    )
+
+    assert output.is_file()
+    assert output.stat().st_size > 1_000
+    assert len(axis.collections) > 0
+    assert {text.get_text() for text in axis.get_legend().get_texts()} >= {
+        "Spin 1",
+        "Spin 2",
+        "Cr",
+        "I",
+    }
+    figure.clear()
+
+
+def test_projection_selection_rejects_unknown_values(cr_i3_bands: BandStructure):
+    with pytest.raises(ValueError, match="Unknown elements"):
+        cr_i3_bands.projection_weights(elements=("Fe",))
+    with pytest.raises(ValueError, match="Unknown orbitals"):
+        cr_i3_bands.projection_weights(orbitals=("f",))
