@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 import xml.etree.ElementTree as ET
 
 import matplotlib.pyplot as plt
@@ -19,6 +19,19 @@ from numpy.typing import NDArray
 
 
 FloatArray = NDArray[np.float64]
+
+_GROUPED_ORBITALS: dict[str, tuple[str, ...]] = {
+    "s": ("s",),
+    "p": ("px", "py", "pz"),
+    "d": ("dxy", "dyz", "dz2", "dxz", "dx2-y2"),
+}
+
+
+def _normalise_orbital(name: str) -> str:
+    cleaned = name.strip().lower().replace("d_x2-y2", "dx2-y2")
+    if cleaned == "x2-y2":
+        return "dx2-y2"
+    return cleaned
 
 
 def _rows(element: ET.Element, tag: str = "v") -> FloatArray:
@@ -106,6 +119,63 @@ def _parse_spin_set(spin: ET.Element) -> tuple[FloatArray, FloatArray]:
         raise ValueError("VASP eigenvalue rows have inconsistent band counts") from exc
 
 
+def _parse_atom_elements(root: ET.Element) -> tuple[str, ...]:
+    atoms = root.find("./atominfo/array[@name='atoms']/set")
+    if atoms is None:
+        raise ValueError("vasprun.xml does not contain atom identities")
+    elements: list[str] = []
+    for row in atoms.findall("rc"):
+        cells = row.findall("c")
+        if not cells or cells[0].text is None:
+            raise ValueError("vasprun.xml contains an atom without an element")
+        elements.append(cells[0].text.strip())
+    if not elements:
+        raise ValueError("vasprun.xml contains no atoms")
+    return tuple(elements)
+
+
+def _parse_projections(
+    root: ET.Element,
+) -> tuple[FloatArray | None, tuple[str, ...], tuple[str, ...]]:
+    """Parse projected weights as ``(spin, kpoint, band, ion, orbital)``."""
+
+    arrays = root.findall(".//calculation/projected/array")
+    if not arrays:
+        return None, (), ()
+    array = arrays[-1]
+    orbitals = tuple(
+        _normalise_orbital(field.text or "") for field in array.findall("field")
+    )
+    if not orbitals or any(not orbital for orbital in orbitals):
+        raise ValueError("VASP projected data contains invalid orbital names")
+    atom_elements = _parse_atom_elements(root)
+    outer = array.find("set")
+    if outer is None:
+        raise ValueError("VASP projected array contains no spin data")
+
+    spin_values: list[list[list[list[list[float]]]]] = []
+    for spin in outer.findall("set"):
+        kpoint_values: list[list[list[list[float]]]] = []
+        for kpoint in spin.findall("set"):
+            band_values: list[list[list[float]]] = []
+            for band in kpoint.findall("set"):
+                rows = _rows(band, "r")
+                if rows.shape != (len(atom_elements), len(orbitals)):
+                    raise ValueError(
+                        "Projected band rows do not match the atom/orbital metadata"
+                    )
+                band_values.append(rows.tolist())
+            kpoint_values.append(band_values)
+        spin_values.append(kpoint_values)
+    try:
+        projections = np.asarray(spin_values, dtype=float)
+    except ValueError as exc:
+        raise ValueError("VASP projected data has inconsistent dimensions") from exc
+    if projections.ndim != 5:
+        raise ValueError("VASP projected data must have spin/kpoint/band/ion/orbital axes")
+    return projections, atom_elements, orbitals
+
+
 @dataclass(frozen=True)
 class BandStructure:
     """Reusable electronic band data parsed from a VASP calculation.
@@ -121,6 +191,9 @@ class BandStructure:
     occupations: FloatArray
     efermi: float
     reciprocal_lattice: FloatArray
+    projections: FloatArray | None = None
+    atom_elements: tuple[str, ...] = ()
+    orbital_names: tuple[str, ...] = ()
     tick_indices: tuple[int, ...] = ()
     tick_labels: tuple[str, ...] = ()
     source: Path | None = None
@@ -136,6 +209,18 @@ class BandStructure:
             raise ValueError("distances must contain one value per k-point")
         if len(self.tick_indices) != len(self.tick_labels):
             raise ValueError("tick_indices and tick_labels must have equal length")
+        if self.projections is not None:
+            expected = (
+                self.spin_count,
+                len(self.kpoints),
+                self.band_count,
+                len(self.atom_elements),
+                len(self.orbital_names),
+            )
+            if self.projections.shape != expected:
+                raise ValueError(
+                    f"projections must have shape {expected}, got {self.projections.shape}"
+                )
 
     @property
     def shifted_energies(self) -> FloatArray:
@@ -211,6 +296,12 @@ class BandStructure:
             raise ValueError("vasprun.xml does not contain a Fermi energy")
         efermi = float(efermi_elements[-1].text)
 
+        projections, atom_elements, orbital_names = _parse_projections(root)
+        if projections is not None and projections.shape[:3] != energies.shape:
+            raise ValueError(
+                "Projected data and eigenvalues have different spin/k-point/band dimensions"
+            )
+
         cartesian = kpoints @ reciprocal_lattice
         step_lengths = np.linalg.norm(np.diff(cartesian, axis=0), axis=1)
         distances = np.concatenate(([0.0], np.cumsum(step_lengths)))
@@ -233,10 +324,94 @@ class BandStructure:
             occupations=occupations,
             efermi=efermi,
             reciprocal_lattice=reciprocal_lattice,
+            projections=projections,
+            atom_elements=atom_elements,
+            orbital_names=orbital_names,
             tick_indices=tuple(tick_indices),
             tick_labels=tuple(tick_labels),
             source=xml_path.resolve(),
         )
+
+    def projection_weights(
+        self,
+        *,
+        elements: Sequence[str] | None = None,
+        orbitals: Sequence[str] | None = None,
+    ) -> dict[str, FloatArray]:
+        """Return named projected weights for element and/or orbital selections.
+
+        Grouped orbital names ``s``, ``p``, and ``d`` expand to their detailed
+        components.  Supplying both element and orbital selections produces a
+        component for every element/orbital pair.
+        """
+
+        if self.projections is None:
+            raise ValueError("This vasprun.xml does not contain projected eigenvalues")
+        available_elements = tuple(dict.fromkeys(self.atom_elements))
+        selected_elements = tuple(elements) if elements else ()
+        selected_orbitals = tuple(_normalise_orbital(item) for item in orbitals or ())
+
+        unknown_elements = sorted(set(selected_elements) - set(available_elements))
+        if unknown_elements:
+            raise ValueError(
+                "Unknown elements: "
+                + ", ".join(unknown_elements)
+                + "; available: "
+                + ", ".join(available_elements)
+            )
+        unknown_orbitals = sorted(
+            orbital
+            for orbital in selected_orbitals
+            if orbital not in _GROUPED_ORBITALS and orbital not in self.orbital_names
+        )
+        if unknown_orbitals:
+            raise ValueError(
+                "Unknown orbitals: "
+                + ", ".join(unknown_orbitals)
+                + "; available: "
+                + ", ".join(self.orbital_names)
+            )
+
+        element_groups: list[tuple[str, NDArray[np.int_]]]
+        orbital_groups: list[tuple[str, NDArray[np.int_]]]
+        if selected_elements:
+            element_groups = [
+                (
+                    element,
+                    np.asarray(
+                        [i for i, value in enumerate(self.atom_elements) if value == element],
+                        dtype=int,
+                    ),
+                )
+                for element in selected_elements
+            ]
+        else:
+            element_groups = [("", np.arange(len(self.atom_elements), dtype=int))]
+
+        if selected_orbitals:
+            orbital_groups = []
+            for name in selected_orbitals:
+                members = _GROUPED_ORBITALS.get(name, (name,))
+                indices = np.asarray(
+                    [i for i, value in enumerate(self.orbital_names) if value in members],
+                    dtype=int,
+                )
+                if not len(indices):
+                    raise ValueError(f"Projection data has no components for orbital {name!r}")
+                orbital_groups.append((name, indices))
+        else:
+            orbital_groups = [("", np.arange(len(self.orbital_names), dtype=int))]
+
+        components: dict[str, FloatArray] = {}
+        for element, ion_indices in element_groups:
+            for orbital, orbital_indices in orbital_groups:
+                label = " ".join(part for part in (element, orbital) if part)
+                if not label:
+                    label = "total"
+                selected = np.take(self.projections, ion_indices, axis=3)
+                selected = np.take(selected, orbital_indices, axis=4)
+                components[label] = selected.sum(axis=(3, 4))
+        return components
 
     def plot(
         self,
@@ -245,7 +420,16 @@ class BandStructure:
         figsize: tuple[float, float] = (7.2, 5.4),
         linewidth: float = 1.15,
         colors: str | Sequence[str] = ("#174A7E", "#C44E52"),
+        font_size: float = 12.0,
+        fermi_linewidth: float = 0.9,
+        symmetry_linewidth: float = 0.7,
         show_fermi: bool = True,
+        elements: Sequence[str] | None = None,
+        orbitals: Sequence[str] | None = None,
+        projection_colors: Sequence[str] | Mapping[str, str] | None = None,
+        projection_scale: float = 44.0,
+        projection_threshold: float = 0.015,
+        show_legend: bool = True,
         labels: Sequence[str] | None = None,
         output: str | Path | None = None,
         dpi: int = 300,
@@ -261,6 +445,12 @@ class BandStructure:
             raise ValueError("linewidth must be positive")
         if dpi <= 0:
             raise ValueError("dpi must be positive")
+        if font_size <= 0:
+            raise ValueError("font_size must be positive")
+        if projection_scale <= 0:
+            raise ValueError("projection_scale must be positive")
+        if projection_threshold < 0:
+            raise ValueError("projection_threshold must be non-negative")
         if ax is None:
             figure, ax = plt.subplots(figsize=figsize, constrained_layout=True)
         else:
@@ -270,10 +460,62 @@ class BandStructure:
         if not palette:
             raise ValueError("colors must contain at least one color")
         shifted = self.shifted_energies
+        projecting = bool(elements or orbitals)
         for spin in range(self.spin_count):
             color = palette[spin % len(palette)]
             for band in range(self.band_count):
-                ax.plot(self.distances, shifted[spin, :, band], color=color, lw=linewidth)
+                ax.plot(
+                    self.distances,
+                    shifted[spin, :, band],
+                    color=color,
+                    lw=linewidth,
+                    alpha=0.28 if projecting else 1.0,
+                )
+
+        if projecting:
+            components = self.projection_weights(elements=elements, orbitals=orbitals)
+            default_projection_colors = (
+                "#0072B2",
+                "#D55E00",
+                "#009E73",
+                "#CC79A7",
+                "#E69F00",
+                "#56B4E9",
+                "#000000",
+            )
+            if isinstance(projection_colors, Mapping):
+                component_colors = {
+                    name: projection_colors.get(
+                        name, default_projection_colors[i % len(default_projection_colors)]
+                    )
+                    for i, name in enumerate(components)
+                }
+            else:
+                sequence = list(projection_colors or default_projection_colors)
+                if not sequence:
+                    raise ValueError("projection_colors must contain at least one color")
+                component_colors = {
+                    name: sequence[i % len(sequence)] for i, name in enumerate(components)
+                }
+            markers = ("o", "x")
+            for component, weights in components.items():
+                for spin in range(self.spin_count):
+                    for band in range(self.band_count):
+                        weight = np.clip(weights[spin, :, band], 0.0, None)
+                        mask = weight >= projection_threshold
+                        if not np.any(mask):
+                            continue
+                        ax.scatter(
+                            self.distances[mask],
+                            shifted[spin, mask, band],
+                            s=np.maximum(4.0, projection_scale * weight[mask]),
+                            c=component_colors[component],
+                            marker=markers[spin % len(markers)],
+                            linewidths=0.7,
+                            alpha=0.72,
+                            edgecolors="none" if markers[spin % len(markers)] == "o" else None,
+                            zorder=3,
+                        )
 
         tick_labels = tuple(labels) if labels is not None else self.tick_labels
         if tick_labels:
@@ -282,30 +524,68 @@ class BandStructure:
             tick_positions = self.distances[np.asarray(self.tick_indices)]
             ax.set_xticks(tick_positions, tick_labels)
             for position in tick_positions:
-                ax.axvline(position, color="#777777", lw=0.65, alpha=0.55, zorder=0)
+                ax.axvline(
+                    position,
+                    color="#777777",
+                    lw=symmetry_linewidth,
+                    alpha=0.55,
+                    zorder=0,
+                )
         else:
             ax.set_xlabel(r"Wave vector $k$")
 
         if show_fermi:
-            ax.axhline(0.0, color="#333333", linestyle="--", lw=0.85, alpha=0.8)
+            ax.axhline(
+                0.0,
+                color="#333333",
+                linestyle="--",
+                lw=fermi_linewidth,
+                alpha=0.85,
+            )
         if ylim is not None:
             if ylim[0] >= ylim[1]:
                 raise ValueError("ylim lower bound must be smaller than upper bound")
             ax.set_ylim(*ylim)
         ax.set_xlim(float(self.distances[0]), float(self.distances[-1]))
         ax.set_ylabel(r"$E - E_\mathrm{F}$ (eV)")
-        ax.tick_params(direction="in", top=True, right=True)
+        ax.tick_params(direction="in", top=True, right=True, labelsize=font_size)
+        ax.xaxis.label.set_size(font_size)
+        ax.yaxis.label.set_size(font_size)
         for spine in ax.spines.values():
             spine.set_linewidth(1.0)
 
-        if self.spin_count > 1:
+        if show_legend and (self.spin_count > 1 or projecting):
             from matplotlib.lines import Line2D
 
-            ax.legend(
-                [Line2D([0], [0], color=palette[i % len(palette)], lw=linewidth) for i in range(self.spin_count)],
-                [f"Spin {i + 1}" for i in range(self.spin_count)],
-                frameon=False,
-            )
+            handles: list[Line2D] = []
+            legend_labels: list[str] = []
+            if self.spin_count > 1:
+                for i in range(self.spin_count):
+                    handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            color=palette[i % len(palette)],
+                            marker=("o", "x")[i % 2] if projecting else None,
+                            lw=linewidth,
+                        )
+                    )
+                    legend_labels.append(f"Spin {i + 1}")
+            if projecting:
+                for component in components:
+                    handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            color="none",
+                            marker="o",
+                            markerfacecolor=component_colors[component],
+                            markeredgecolor="none",
+                            markersize=7,
+                        )
+                    )
+                    legend_labels.append(component)
+            ax.legend(handles, legend_labels, frameon=False, fontsize=font_size - 1)
 
         if output is not None:
             destination = Path(output).expanduser()
